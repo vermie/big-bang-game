@@ -125,6 +125,11 @@ namespace BigBang.Orchestrator
 
                 foreach (var r in results)
                 {
+                    if (r.Exception != null)
+                    {
+                        continue;
+                    }
+
                     var p1 = players.First(p => p == r.P1);
                     var p2 = players.First(p => p == r.P2);
 
