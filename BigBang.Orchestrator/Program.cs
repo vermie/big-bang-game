@@ -9,7 +9,7 @@ using Combinatorics.Collections;
 namespace BigBang.Orchestrator
 {
     using System.Diagnostics;
-    using System.Collections.Concurrent;
+    using System.Threading;
 
     public class Program
     {
@@ -117,16 +117,11 @@ namespace BigBang.Orchestrator
                 var tourneyTimer = new Stopwatch();
                 tourneyTimer.Start();
 
-                var matchGenerator = new MatchGenerator();
+                var matchGenerator = new MatchGenerator(players);
 
-                var parallelMatches = matchGenerator.Generate(players)
-                                                    .AsParallel()
-                                                    .WithDegreeOfParallelism(Environment.ProcessorCount)
-                                                    .WithExecutionMode(ParallelExecutionMode.ForceParallelism)
-                                                    .WithMergeOptions(ParallelMergeOptions.FullyBuffered);
+                var task = DispatchMatchesToTasks(matchGenerator, Environment.ProcessorCount);
 
-                var results = parallelMatches.Select(match => Play(match))
-                                             .ToList();
+                var results = task.Result;
 
                 foreach (var r in results)
                 {
@@ -173,7 +168,7 @@ namespace BigBang.Orchestrator
                 var printResults = PrintResultGrid(resultGrid);
                 sw.WriteLine(printResults);
                 sw.WriteLine("Total Players: {0}", players.Count);
-                sw.WriteLine("Total Matches Completed: {0}", results.Count);
+                sw.WriteLine("Total Matches Completed: {0}", results.Count());
                 sw.WriteLine("Total Tourney Time: {0}", tourneyTimer.Elapsed);
 
                 Console.WriteLine(printResults);
@@ -184,6 +179,44 @@ namespace BigBang.Orchestrator
                 Path.Combine(logdir, string.Format("Tournament-{0:yyyy-MM-dd-HH-mm-ss}.txt", DateTime.Now)));
             Console.WriteLine("Done!");
             Console.ReadLine();
+        }
+
+        private static Task<IEnumerable<Result>> DispatchMatchesToTasks(MatchGenerator matchGenerator, int threadCount)
+        {
+            // create multiple tasks
+            var workerTasks = Enumerable.Range(0, threadCount)
+                                        .Select(i => CreateMatchPlayingWorkerTask(matchGenerator));
+
+            // create master task to wait for all the worker tasks
+            // add a continuation to coallesce the the separate sets of results into one list
+            var masterTask = Task.WhenAll(workerTasks)
+                                 .ContinueWith(t => t.Result.SelectMany(l => l));
+
+            return masterTask;
+        }
+
+        private static Task<List<Result>> CreateMatchPlayingWorkerTask(MatchGenerator matchGenerator)
+        {
+            // create a worker task which requests work (matches) from the MatchGenerator
+            return Task.Factory.StartNew(() =>
+            {
+                var processorResults = new List<Result>();
+                Match match = null;
+
+                while (true)
+                {
+                    match = matchGenerator.FinishAndGetNextMatch(match);
+
+                    if (match == null)
+                    {
+                        break;
+                    }
+
+                    processorResults.Add(Play(match));
+                }
+
+                return processorResults;
+            });
         }
 
         private static string PrintResultGrid(IEnumerable<Player> resultGrid )
@@ -246,7 +279,6 @@ namespace BigBang.Orchestrator
 
         private static Result Play(Match match)
         {
-            using (match)
             try
             {
                 Player p1 = match.P1,
@@ -509,11 +541,8 @@ namespace BigBang.Orchestrator
 
     public class Match : IDisposable
     {
-        private IMatchCompleter _generator;
-
-        public Match(IMatchCompleter generator, Player p1, Player p2)
+        public Match(Player p1, Player p2)
         {
-            _generator = generator;
             P1 = p1;
             P2 = p2;
         }
@@ -536,69 +565,67 @@ namespace BigBang.Orchestrator
 
         public void Dispose()
         {
-            _generator.Complete(this);
         }
-    }
-
-    public interface IMatchCompleter
-    {
-        void Complete(Match match);
     }
 
     // we have to make sure a player is only playing one game at a time, otherwise they may have concurrency issues with their data directory
-    public class MatchGenerator : IMatchCompleter
+    public class MatchGenerator
     {
-        // use this blocking collection as a message pump
-        // the PLINQ threads executing a match will add id to this collection when completed
-        // the generator function consumes completed matches, then
-        private BlockingCollection<Match> _matchCompletionQueue = new BlockingCollection<Match>();
+        private List<Match> _pendingMatches;
 
-        public IEnumerable<Match> Generate(IList<Player> players)
+        private Queue<Match> _readyMatches = new Queue<Match>();
+
+        // keep a list of ongoing matches
+        private List<Match> _currentMatches = new List<Match>();
+
+        private readonly object _lock = new object();
+
+        public MatchGenerator(IList<Player> players)
         {
             // generate all combinations of players
-            var matches = new Combinations<Player>(players, 2, GenerateOption.WithoutRepetition)
-                            .Select(c => new Match(this, c[0], c[1]))
-                            .ToList();
+            _pendingMatches = new Combinations<Player>(players, 2, GenerateOption.WithoutRepetition)
+                                .Select(c => new Match(c[0], c[1]))
+                                .ToList();
 
-            // keep a list of ongoing matches
-            var currentMatches = new List<Match>();
+            // 'prime the pump' with matches
+            ReadyAllPossibleMatches();
+        }
 
-            while (true)
+        public Match FinishAndGetNextMatch(Match match)
+        {
+            lock (_lock)
             {
-                // find all matches where both players are available
-                var nextMatches = new List<Match>();
-                for (var i = 0; i < matches.Count; ++i)
+                _currentMatches.Remove(match);
+
+                ReadyAllPossibleMatches();
+
+                if (_readyMatches.Count == 0)
                 {
-                    var match = matches[i];
-                    if (!(match.ConflictsWith(nextMatches) || match.ConflictsWith(currentMatches)))
-                    {
-                        nextMatches.Add(match);
-                        matches.RemoveAt(i--);
-                    }
+                    // no more matches
+                    return null;
                 }
 
-                // dispatch these matches to be played
-                foreach (var match in nextMatches)
-                {
-                    yield return match;
-                    currentMatches.Add(match);
-                }
+                // get the next match, and mark it as a current match
+                var nextMatch = _readyMatches.Dequeue();
+                _currentMatches.Add(nextMatch);
 
-                // bail if there aren't any more matches to play (the generator doesn't need to wait for the current matches to finish)
-                if (matches.Count == 0)
-                {
-                    break;
-                }
-
-                // wait for a match to complete before continuing
-                var matchThatJustFinished = _matchCompletionQueue.Take();
-                currentMatches.Remove(matchThatJustFinished);
+                return nextMatch;
             }
         }
 
-        void IMatchCompleter.Complete(Match match)
+        private void ReadyAllPossibleMatches()
         {
-            _matchCompletionQueue.Add(match);
+            // find all matches where both players are available
+            for (var i = 0; i < _pendingMatches.Count; ++i)
+            {
+                var match = _pendingMatches[i];
+                if (!match.ConflictsWith(_currentMatches) && !match.ConflictsWith(_readyMatches))
+                {
+                    _readyMatches.Enqueue(match);
+
+                    _pendingMatches.Remove(match);
+                }
+            }
         }
     }
 }
