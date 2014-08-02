@@ -529,6 +529,11 @@ namespace BigBang.Orchestrator
                    otherMatch.P2 == this.P2;
         }
 
+        public bool ConflictsWith(IEnumerable<Match> matches)
+        {
+            return matches.Any(m => m.ConflictsWith(this));
+        }
+
         public void Dispose()
         {
             _generator.Complete(this);
@@ -565,7 +570,7 @@ namespace BigBang.Orchestrator
                 for (var i = 0; i < matches.Count; ++i)
                 {
                     var match = matches[i];
-                    if (!(nextMatches.Any(m => m.ConflictsWith(match)) || currentMatches.Any(m => m.ConflictsWith(match))))
+                    if (!(match.ConflictsWith(nextMatches) || match.ConflictsWith(currentMatches)))
                     {
                         nextMatches.Add(match);
                         matches.RemoveAt(i--);
